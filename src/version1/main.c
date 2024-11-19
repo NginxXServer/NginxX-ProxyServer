@@ -1,5 +1,7 @@
 #include <stdio.h>
 
+extern int run_proxy(int listen_port, int target_port, char* target_host);
+
 int main() {
     int listen_port = 39071;
     int target_port = 39076;
