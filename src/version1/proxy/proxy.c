@@ -23,6 +23,13 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
         return 1;
     }
 
+    // SO_REUSEADDR 옵션 설정
+    int reuse = 1;
+    if (setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        perror("setsockopt");
+        return 1;
+    }
+
     // 리스닝 소켓 주소 설정
     memset(&listen_addr, 0, sizeof(listen_addr));
     listen_addr.sin_family = AF_INET;
@@ -72,30 +79,26 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
             continue;
         }
 
-        // 클라이언트 요청을 target 서버로 전달
-        while ((bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        // 클라이언트로부터 데이터 수신 및 target 서버로 전달
+        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
             if (send(target_socket, buffer, bytes_received, 0) < 0) {
-                perror("send");
-                break;
+                perror("send to target");
             }
+        } else if (bytes_received < 0) {
+            perror("recv from client");
         }
 
-        if (bytes_received < 0) {
-            perror("recv");
-        }
-
-        // target 서버의 응답을 클라이언트로 전달
-        while ((bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        // target 서버로부터 응답 수신 및 클라이언트로 전달
+        bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
             if (send(client_socket, buffer, bytes_received, 0) < 0) {
-                perror("send");
-                break;
+                perror("send to client");
             }
-        }
-
-        if (bytes_received < 0) {
-            perror("recv");
+        } else if (bytes_received < 0) {
+            perror("recv from target");
         }
 
         close(client_socket);
