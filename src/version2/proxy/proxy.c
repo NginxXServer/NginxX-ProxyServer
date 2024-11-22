@@ -12,7 +12,8 @@
 
 int run_proxy(int listen_port, int target_port, char* target_host) {
     int listen_socket, target_socket;
-    struct sockaddr_in listen_addr, target_addr;
+    struct sockaddr_in listen_addr, target_addr, client_addr;  
+    socklen_t client_addr_len = sizeof(client_addr);  
     char buffer[BUFFER_SIZE];
     int bytes_received;
 
@@ -53,7 +54,8 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
     printf("Reverse proxy server listening on port %d\n", listen_port);
 
     while (1) {
-        int client_socket = accept(listen_socket, NULL, NULL);
+        // client_addr 정보를 받도록 수정
+        int client_socket = accept(listen_socket, (struct sockaddr*)&client_addr, &client_addr_len);
         if (client_socket < 0) {
             perror("accept");
             continue;
@@ -81,26 +83,37 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
 
         // 클라이언트로부터 데이터 수신 및 target 서버로 전달
         bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-	printf("recv from client %s\n", buffer);
+        printf("recv from client %s\n", buffer);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
             if (send(target_socket, buffer, bytes_received, 0) < 0) {
                 perror("send to target");
             }
-	    printf("send to target %s\n", buffer);
+            printf("send to target %s\n", buffer);
         } else if (bytes_received < 0) {
             perror("recv from client");
         }
 
         // target 서버로부터 응답 수신 및 클라이언트로 전달
         bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
-	printf("recv from server %s\n", buffer);
+        printf("recv from server %s\n", buffer);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
+
+            int status_code = 0;
+            if (strstr(buffer, "200 OK")) {
+                status_code = 200;
+            } else if (strstr(buffer, "404 Not Found")) {
+                status_code = 404;
+            }
+            
+            //logging
+            log_http_response(inet_ntoa(client_addr.sin_addr), status_code, buffer);
+
             if (send(client_socket, buffer, bytes_received, 0) < 0) {
                 perror("send to client");
             }
-	    printf("send to client %s\n", buffer);
+            printf("send to client %s\n", buffer);
         } else if (bytes_received < 0) {
             perror("recv from target");
         }
