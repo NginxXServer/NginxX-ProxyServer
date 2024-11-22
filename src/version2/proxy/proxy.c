@@ -83,20 +83,17 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
 
         // 클라이언트로부터 데이터 수신 및 target 서버로 전달
         bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        printf("recv from client %s\n", buffer);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
             if (send(target_socket, buffer, bytes_received, 0) < 0) {
                 perror("send to target");
             }
-            printf("send to target %s\n", buffer);
         } else if (bytes_received < 0) {
             perror("recv from client");
         }
 
         // target 서버로부터 응답 수신 및 클라이언트로 전달
         bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
-        printf("recv from server %s\n", buffer);
         if (bytes_received > 0) {
             buffer[bytes_received] = '\0';
 
@@ -113,7 +110,6 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
             if (send(client_socket, buffer, bytes_received, 0) < 0) {
                 perror("send to client");
             }
-            printf("send to client %s\n", buffer);
         } else if (bytes_received < 0) {
             perror("recv from target");
         }
