@@ -7,15 +7,38 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <time.h>
+#include "health.h"
 
 #define BUFFER_SIZE 9999
+static struct backend_pool pool;
 
-int run_proxy(int listen_port, int target_port, char* target_host) {
-    int listen_socket, target_socket;
-    struct sockaddr_in listen_addr, target_addr, client_addr;  
+// 현재 사용할 서버 선택 (간단한 라운드로빈) 해당 함수 수정 바람
+static int current_server = 0;
+int select_server() {
+    int start_idx = current_server;
+    
+    do {
+        if (is_server_available(&pool, current_server)) {
+            int selected = current_server;
+            current_server = (current_server + 1) % MAX_BACKENDS;
+            return selected;
+        }
+        current_server = (current_server + 1) % MAX_BACKENDS;
+    } while (current_server != start_idx);
+    
+    return -1;  // 사용 가능한 서버가 없음
+}
+
+int run_proxy(int listen_port) {
+    int listen_socket;
+    struct sockaddr_in listen_addr, client_addr;  
     socklen_t client_addr_len = sizeof(client_addr);  
     char buffer[BUFFER_SIZE];
     int bytes_received;
+
+    // 백엔드 서버 풀 초기화
+    init_backend_pool(&pool);
 
     // 리스닝 소켓 생성
     listen_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -54,65 +77,80 @@ int run_proxy(int listen_port, int target_port, char* target_host) {
     printf("Reverse proxy server listening on port %d\n", listen_port);
 
     while (1) {
-        // client_addr 정보를 받도록 수정
         int client_socket = accept(listen_socket, (struct sockaddr*)&client_addr, &client_addr_len);
         if (client_socket < 0) {
             perror("accept");
             continue;
         }
 
-        // 클라이언트 요청을 target 서버로 전달
-        target_socket = socket(AF_INET, SOCK_STREAM, 0);
+        // 백엔드 서버 선택
+        int server_idx = select_server();
+        if (server_idx < 0) {
+            close(client_socket);
+            continue;
+        }
+
+        struct backend_server* server = &pool.servers[server_idx];
+        int target_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (target_socket < 0) {
             perror("socket");
             close(client_socket);
             continue;
         }
 
+        // 요청 시작 시간 기록
+        struct timespec start_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+        
+        // 요청 시작 추적
+        track_request_start(&pool, server_idx);
+
+        struct sockaddr_in target_addr;
         memset(&target_addr, 0, sizeof(target_addr));
         target_addr.sin_family = AF_INET;
-        target_addr.sin_port = htons(target_port);
-        target_addr.sin_addr.s_addr = inet_addr(target_host);
+        target_addr.sin_port = htons(server->port);
+        target_addr.sin_addr.s_addr = inet_addr(server->address);
 
+        bool request_success = true;
         if (connect(target_socket, (struct sockaddr*)&target_addr, sizeof(target_addr)) < 0) {
             perror("connect");
-            close(client_socket);
-            close(target_socket);
-            continue;
+            request_success = false;
+        } else {
+            // 클라이언트로부터 데이터 수신 및 target 서버로 전달
+            bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+            if (bytes_received > 0) {
+                buffer[bytes_received] = '\0';
+                if (send(target_socket, buffer, bytes_received, 0) < 0) {
+                    perror("send to target");
+                    request_success = false;
+                }
+            } else if (bytes_received < 0) {
+                perror("recv from client");
+                request_success = false;
+            }
+
+            // target 서버로부터 응답 수신 및 클라이언트로 전달
+            bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
+            if (bytes_received > 0) {
+                buffer[bytes_received] = '\0';
+                if (send(client_socket, buffer, bytes_received, 0) < 0) {
+                    perror("send to client");
+                    request_success = false;
+                }
+            } else if (bytes_received < 0) {
+                perror("recv from target");
+                request_success = false;
+            }
         }
 
-        // 클라이언트로부터 데이터 수신 및 target 서버로 전달
-        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-            if (send(target_socket, buffer, bytes_received, 0) < 0) {
-                perror("send to target");
-            }
-        } else if (bytes_received < 0) {
-            perror("recv from client");
-        }
+        // 요청 종료 시간 계산
+        struct timespec end_time;
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        double response_time = (end_time.tv_sec - start_time.tv_sec) * 1000.0 + 
+                             (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
 
-        // target 서버로부터 응답 수신 및 클라이언트로 전달
-        bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0';
-
-            int status_code = 0;
-            if (strstr(buffer, "200 OK")) {
-                status_code = 200;
-            } else if (strstr(buffer, "404 Not Found")) {
-                status_code = 404;
-            }
-            
-            //logging
-            log_http_response(inet_ntoa(client_addr.sin_addr), status_code, buffer);
-
-            if (send(client_socket, buffer, bytes_received, 0) < 0) {
-                perror("send to client");
-            }
-        } else if (bytes_received < 0) {
-            perror("recv from target");
-        }
+        // 요청 종료 추적
+        track_request_end(&pool, server_idx, request_success, response_time);
 
         close(client_socket);
         close(target_socket);
