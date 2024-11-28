@@ -43,20 +43,23 @@ static int select_server() {
 
 // 새로운 클라이언트 연결 처리
 static void handle_new_connection(int epoll_fd, int listen_fd) {
-    while (1) {  // Edge trigger 모드에서는 모든 연결을 처리
+    //하나의 이벤트로 여러 연결 요청이 들어올 수 있으므로 iteration
+    while (1) {  
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         
+        //큐에 있는 연결 처리
         int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;  // 더 이상 처리할 연결 없음
+                //더 이상 처리할 연결이 없음
+                break;  
             }
             log_message(LOG_ERROR, "Accept failed: %s", strerror(errno));
             break;
         }
         
-        // 비동기 설정
+        //비동기 설정
         if (set_nonblocking(client_fd) < 0) {
             log_message(LOG_ERROR, "Failed to set client socket non-blocking");
             close(client_fd);
@@ -65,10 +68,12 @@ static void handle_new_connection(int epoll_fd, int listen_fd) {
         
         log_message(LOG_INFO, "New connection from %s", inet_ntoa(client_addr.sin_addr));
         
+        // edge trigger 모드로 client 요청 처리
         struct epoll_event event;
-        event.events = EPOLLIN | EPOLLET;  // Edge trigger 모드
+        event.events = EPOLLIN | EPOLLET;  
         event.data.fd = client_fd;
         
+        //새로운 클라이언트를 epoll_fd에 추가
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
             log_message(LOG_ERROR, "Failed to add client to epoll: %s", strerror(errno));
             close(client_fd);
@@ -81,14 +86,14 @@ static void handle_client(int client_fd) {
     char buffer[BUFFER_SIZE];
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
-    ssize_t bytes_read;  // 여기로 이동
+    ssize_t bytes_read;  
     
     getpeername(client_fd, (struct sockaddr*)&client_addr, &addr_len);
     const char* client_ip = inet_ntoa(client_addr.sin_addr);
     
-    // Edge trigger에서는 모든 데이터를 읽어야 함
     ssize_t total_read = 0;
     while (1) {
+        //모든 데이터 한 번에 읽기
         bytes_read = recv(client_fd, buffer + total_read, 
                                 BUFFER_SIZE - total_read - 1, 0);
         if (bytes_read < 0) {
@@ -104,9 +109,10 @@ static void handle_client(int client_fd) {
             close(client_fd);
             return;
         }
+
         total_read += bytes_read;
         
-        // 버퍼가 거의 다 찼거나, HTTP 요청의 끝을 발견하면 중단
+        //HTTP 요청의 끝을 발견하면 중단
         if (total_read >= BUFFER_SIZE - 1 || strstr(buffer, "\r\n\r\n")) {
             break;
         }
@@ -120,7 +126,7 @@ static void handle_client(int client_fd) {
     buffer[total_read] = '\0';
     log_message(LOG_INFO, "Received %zd bytes from client %s", total_read, client_ip);
     
-    // Step 2: 백엔드 서버 선택
+    // 백엔드 서버 선택
     int server_idx = select_server();
     if (server_idx < 0) {
         log_message(LOG_ERROR, "Failed to select backend server for client %s", client_ip);
@@ -131,7 +137,7 @@ static void handle_client(int client_fd) {
     struct backend_server* server = &pool.servers[server_idx];
     track_request_start(&pool, server_idx);
     
-    // Step 3: 백엔드 연결
+    // 백엔드 연결
     int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (backend_fd < 0) {
         log_message(LOG_ERROR, "Failed to create backend socket: %s", strerror(errno));
@@ -155,8 +161,8 @@ static void handle_client(int client_fd) {
         return;
     }
     
-    // Step 4: 백엔드로 요청 전송
-    ssize_t sent = send(backend_fd, buffer, total_read, 0);  // total_read 사용
+    // 백엔드로 요청 전송
+    ssize_t sent = send(backend_fd, buffer, total_read, 0);  // 클라이언트로부터 받은 만큼 전송함
     if (sent < 0) {
         log_message(LOG_ERROR, "Failed to send to backend %s:%d: %s", 
                     server->address, server->port, strerror(errno));
@@ -165,14 +171,14 @@ static void handle_client(int client_fd) {
     log_message(LOG_INFO, "Sent %zd bytes to backend %s:%d", 
                 sent, server->address, server->port);
     
-     // Step 5: 백엔드로부터 응답 수신
-    total_read = 0;  // 응답 데이터를 위해 재사용
+     // 백엔드로부터 응답 수신, 클라이언트로부터 요청 수신과 거의 똑같은 알고리즘
+    total_read = 0;  
     while (1) {
         bytes_read = recv(backend_fd, buffer + total_read, 
                          BUFFER_SIZE - total_read - 1, 0);
         if (bytes_read < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;  // 더 이상 읽을 데이터가 없음
+                break;  
             }
             log_message(LOG_ERROR, "Failed to receive from backend %s:%d: %s", 
                         server->address, server->port, strerror(errno));
@@ -183,7 +189,7 @@ static void handle_client(int client_fd) {
         }
         total_read += bytes_read;
         
-        // 버퍼가 거의 다 찼으면 중단
+       
         if (total_read >= BUFFER_SIZE - 1) {
             break;
         }
@@ -197,7 +203,7 @@ static void handle_client(int client_fd) {
     log_message(LOG_INFO, "Received %zd bytes from backend %s:%d", 
                 total_read, server->address, server->port);
     
-    // Step 6: 클라이언트로 응답 전송 (total_read 사용)
+    // 클라이언트로 응답 전송, total_read로 받은 응답 만큼 전송
     sent = send(client_fd, buffer, total_read, 0);
     if (sent < 0) {
         log_message(LOG_ERROR, "Failed to send response to client %s: %s", 
@@ -213,14 +219,18 @@ cleanup:
 }
 
 int run_proxy(int listen_port) {
+    //백엔드 풀 초기화
     init_backend_pool(&pool);
     log_message(LOG_INFO, "Backend server pool initialized with %d servers", MAX_BACKENDS);
     
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) return 1;
     
+    //소켓 재사용 설정
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    //비동기로 non blocking socekt 사용
     set_nonblocking(listen_fd);
     
     struct sockaddr_in listen_addr;
@@ -239,6 +249,7 @@ int run_proxy(int listen_port) {
         return 1;
     }
     
+    //epoll 인스턴스 생성
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         close(listen_fd);
@@ -247,20 +258,25 @@ int run_proxy(int listen_port) {
     
     struct epoll_event event;
     event.events = EPOLLIN | EPOLLET;  // Edge trigger 모드
-    event.data.fd = listen_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event);
+    event.data.fd = listen_fd; 
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event); // epoll_fd가 listen_fd를 event 방식으로 감시함.
     
     log_message(LOG_INFO, "Reverse proxy server listening on port %d", listen_port);
     
-    struct epoll_event events[MAX_EVENTS];
+    struct epoll_event events[MAX_EVENTS]; // 발생한 이벤트들 저장
     while (1) {
+        //이벤트 발생 대기, 발생한 이벤트는 events에 추가됨.
+        //한 iteration을 돌면 events는 덮어 씌워짐
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0) continue;
         
+        //발생한 event에 대해 처리
         for (int n = 0; n < nfds; n++) {
             if (events[n].data.fd == listen_fd) {
+                //handle_new_connection를 통해 client 요청을 epoll 감시 대상으로 등록
                 handle_new_connection(epoll_fd, listen_fd);
             } else {
+                //client 요청 처리 및 클라이언트 연결 종료
                 handle_client(events[n].data.fd);
             }
         }
