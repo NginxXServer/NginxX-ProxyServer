@@ -25,9 +25,6 @@ void init_backend_pool(struct backend_pool* pool) {
     }
 }
 
-// void cleanup_backend_pool(struct backend_pool* pool) {
-   
-// }
 
 void track_request_start(struct backend_pool* pool, int server_idx) {
     struct backend_server* server = &pool->servers[server_idx];

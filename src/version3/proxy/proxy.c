@@ -7,117 +7,136 @@
 #include <sys/epoll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <stdbool.h>
-#include <time.h>
 #include "health.h"
 #include "../utils/logger.h"
 
 #define BUFFER_SIZE 9999
-#define MAX_EVENTS 10000
+#define MAX_EVENTS 100
 
 static struct backend_pool pool;
 static int current_server = 0;
 
-struct connection_state {
-    int fd;                     // 소켓 파일 디스크립터
-    bool is_backend;            // backend 연결인지 여부
-    int backend_fd;             
-    int client_fd;              
-    char buffer[BUFFER_SIZE];   
-    size_t buffer_size;        
-    struct sockaddr_in addr;    
-    struct timespec start_time; 
-};
-
-// non-blocking 소켓 설정 함수
+// non-blocking 소켓 설정
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        log_message(LOG_ERROR, "Failed to get socket flags");
-        return -1;
-    }
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        log_message(LOG_ERROR, "Failed to set socket non-blocking");
-        return -1;
-    }
-    return 0;
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-/**
- * 백엔드 서버 선택 함수 (라운드 로빈 방식) -> 이 부분 수정 필요
- * - 서버 선택 시 health check 결과를 반영
- * 
- * 반환값:
- * - 성공: 선택된 서버의 인덱스
- * - 실패: -1 (사용 가능한 서버가 없는 경우)
- */
-int select_server() {
+// 백엔드 서버 선택
+static int select_server() {
     int selected = current_server;
     current_server = (current_server + 1) % MAX_BACKENDS;
     
-    log_message(LOG_INFO, "Selected backend server %s:%d", 
-        pool.servers[selected].address, 
-        pool.servers[selected].port);
-    
-    return selected;
-}
-
-// epoll에 이벤트 추가
-static void add_epoll_event(int epoll_fd, int fd, struct connection_state* state, uint32_t events) {
-    struct epoll_event ev;
-    ev.events = events;
-    ev.data.ptr = state;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        log_message(LOG_ERROR, "Failed to add event to epoll");
+    struct backend_server* server = &pool.servers[selected];
+    if (server->address != NULL && server->port > 0) {
+        log_message(LOG_INFO, "Selected backend server %s:%d",
+                    server->address, server->port);
+        return selected;
     }
+    
+    log_message(LOG_ERROR, "Invalid server configuration at index %d", selected);
+    return -1;
 }
 
 // 새로운 클라이언트 연결 처리
 static void handle_new_connection(int epoll_fd, int listen_fd) {
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    
-    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_addr_len);
-    if (client_fd < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            log_message(LOG_ERROR, "Failed to accept connection");
+    while (1) {  // Edge trigger 모드에서는 모든 연결을 처리
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        
+        int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // 더 이상 처리할 연결 없음
+            }
+            log_message(LOG_ERROR, "Accept failed: %s", strerror(errno));
+            break;
         }
-        return;
+        
+        // 비동기 설정
+        if (set_nonblocking(client_fd) < 0) {
+            log_message(LOG_ERROR, "Failed to set client socket non-blocking");
+            close(client_fd);
+            continue;
+        }
+        
+        log_message(LOG_INFO, "New connection from %s", inet_ntoa(client_addr.sin_addr));
+        
+        struct epoll_event event;
+        event.events = EPOLLIN | EPOLLET;  // Edge trigger 모드
+        event.data.fd = client_fd;
+        
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+            log_message(LOG_ERROR, "Failed to add client to epoll: %s", strerror(errno));
+            close(client_fd);
+            continue;
+        }
+    }
+}
+
+static void handle_client(int client_fd) {
+    char buffer[BUFFER_SIZE];
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    ssize_t bytes_read;  // 여기로 이동
+    
+    getpeername(client_fd, (struct sockaddr*)&client_addr, &addr_len);
+    const char* client_ip = inet_ntoa(client_addr.sin_addr);
+    
+    // Edge trigger에서는 모든 데이터를 읽어야 함
+    ssize_t total_read = 0;
+    while (1) {
+        bytes_read = recv(client_fd, buffer + total_read, 
+                                BUFFER_SIZE - total_read - 1, 0);
+        if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // 더 이상 읽을 데이터가 없음
+            }
+            log_message(LOG_ERROR, "Failed to receive from client %s: %s", 
+                        client_ip, strerror(errno));
+            close(client_fd);
+            return;
+        }
+        if (bytes_read == 0) {  // 연결 종료
+            close(client_fd);
+            return;
+        }
+        total_read += bytes_read;
+        
+        // 버퍼가 거의 다 찼거나, HTTP 요청의 끝을 발견하면 중단
+        if (total_read >= BUFFER_SIZE - 1 || strstr(buffer, "\r\n\r\n")) {
+            break;
+        }
     }
     
-    if (set_nonblocking(client_fd) < 0) {
+    if (total_read == 0) {
         close(client_fd);
         return;
     }
     
-    struct connection_state* state = calloc(1, sizeof(struct connection_state));
-    state->fd = client_fd;
-    state->is_backend = false;
-    state->addr = client_addr;
-    clock_gettime(CLOCK_MONOTONIC, &state->start_time);
+    buffer[total_read] = '\0';
+    log_message(LOG_INFO, "Received %zd bytes from client %s", total_read, client_ip);
     
-    add_epoll_event(epoll_fd, client_fd, state, EPOLLIN | EPOLLET);
-    log_message(LOG_INFO, "New connection from %s", inet_ntoa(client_addr.sin_addr));
-}
-
-// 백엔드 서버로 연결
-static void connect_to_backend(int epoll_fd, struct connection_state* client_state) {
+    // Step 2: 백엔드 서버 선택
     int server_idx = select_server();
     if (server_idx < 0) {
-        free(client_state);
-        close(client_state->fd);
+        log_message(LOG_ERROR, "Failed to select backend server for client %s", client_ip);
+        close(client_fd);
         return;
     }
     
     struct backend_server* server = &pool.servers[server_idx];
-    int backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    track_request_start(&pool, server_idx);
+    
+    // Step 3: 백엔드 연결
+    int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (backend_fd < 0) {
-        log_message(LOG_ERROR, "Failed to create backend socket");
-        free(client_state);
-        close(client_state->fd);
+        log_message(LOG_ERROR, "Failed to create backend socket: %s", strerror(errno));
+        close(client_fd);
+        track_request_end(&pool, server_idx, false, 0);
         return;
     }
     
@@ -127,163 +146,127 @@ static void connect_to_backend(int epoll_fd, struct connection_state* client_sta
     backend_addr.sin_port = htons(server->port);
     backend_addr.sin_addr.s_addr = inet_addr(server->address);
     
-    track_request_start(&pool, server_idx);
-    
     if (connect(backend_fd, (struct sockaddr*)&backend_addr, sizeof(backend_addr)) < 0) {
-        if (errno != EINPROGRESS) {
-            log_message(LOG_ERROR, "Failed to connect to backend");
-            track_request_end(&pool, server_idx, false, 0);
-            free(client_state);
-            close(client_state->fd);
-            close(backend_fd);
-            return;
+        log_message(LOG_ERROR, "Failed to connect to backend %s:%d: %s", 
+                    server->address, server->port, strerror(errno));
+        close(client_fd);
+        close(backend_fd);
+        track_request_end(&pool, server_idx, false, 0);
+        return;
+    }
+    
+    // Step 4: 백엔드로 요청 전송
+    ssize_t sent = send(backend_fd, buffer, total_read, 0);  // total_read 사용
+    if (sent < 0) {
+        log_message(LOG_ERROR, "Failed to send to backend %s:%d: %s", 
+                    server->address, server->port, strerror(errno));
+        goto cleanup;
+    }
+    log_message(LOG_INFO, "Sent %zd bytes to backend %s:%d", 
+                sent, server->address, server->port);
+    
+     // Step 5: 백엔드로부터 응답 수신
+    total_read = 0;  // 응답 데이터를 위해 재사용
+    while (1) {
+        bytes_read = recv(backend_fd, buffer + total_read, 
+                         BUFFER_SIZE - total_read - 1, 0);
+        if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // 더 이상 읽을 데이터가 없음
+            }
+            log_message(LOG_ERROR, "Failed to receive from backend %s:%d: %s", 
+                        server->address, server->port, strerror(errno));
+            goto cleanup;
+        }
+        if (bytes_read == 0) {  // 연결 종료
+            break;
+        }
+        total_read += bytes_read;
+        
+        // 버퍼가 거의 다 찼으면 중단
+        if (total_read >= BUFFER_SIZE - 1) {
+            break;
         }
     }
     
-    struct connection_state* backend_state = calloc(1, sizeof(struct connection_state));
-    backend_state->fd = backend_fd;
-    backend_state->is_backend = true;
-    backend_state->client_fd = client_state->fd;
-    client_state->backend_fd = backend_fd;
+    if (total_read == 0) {
+        goto cleanup;
+    }
     
-    add_epoll_event(epoll_fd, backend_fd, backend_state, EPOLLIN | EPOLLOUT | EPOLLET);
-}
+    buffer[total_read] = '\0';
+    log_message(LOG_INFO, "Received %zd bytes from backend %s:%d", 
+                total_read, server->address, server->port);
+    
+    // Step 6: 클라이언트로 응답 전송 (total_read 사용)
+    sent = send(client_fd, buffer, total_read, 0);
+    if (sent < 0) {
+        log_message(LOG_ERROR, "Failed to send response to client %s: %s", 
+                    client_ip, strerror(errno));
+    } else {
+        log_message(LOG_INFO, "Sent %zd bytes to client %s", sent, client_ip);
+    }
 
-// 데이터 전송 처리
-static void handle_data(int epoll_fd, struct connection_state* state, uint32_t events) {
-    if (events & EPOLLIN) {
-        // 데이터 읽기
-        ssize_t bytes_received = recv(state->fd, 
-                                    state->buffer + state->buffer_size,
-                                    BUFFER_SIZE - state->buffer_size, 0);
-                                    
-        if (bytes_received <= 0) {
-            if (bytes_received == 0 || errno != EAGAIN) {
-                // 연결 종료 또는 에러
-                close(state->fd);
-                if (!state->is_backend) {
-                    close(state->backend_fd);
-                } else {
-                    close(state->client_fd);
-                }
-                free(state);
-                return;
-            }
-        } else {
-            state->buffer_size += bytes_received;
-            state->buffer[state->buffer_size] = '\0';
-            
-            int target_fd = state->is_backend ? state->client_fd : state->backend_fd;
-            ssize_t bytes_sent = send(target_fd, state->buffer, state->buffer_size, 0);
-            
-            if (bytes_sent < 0 && errno != EAGAIN) {
-                // 전송 에러 처리
-                close(state->fd);
-                close(target_fd);
-                free(state);
-                return;
-            }
-            
-            // 버퍼 리셋
-            state->buffer_size = 0;
-        }
-    }
+cleanup:
+    close(backend_fd);
+    close(client_fd);
+    track_request_end(&pool, server_idx, bytes_read > 0, 0);
 }
 
 int run_proxy(int listen_port) {
-    int listen_fd;
-    struct sockaddr_in listen_addr;
-    
-    // 백엔드 풀 초기화
     init_backend_pool(&pool);
     log_message(LOG_INFO, "Backend server pool initialized with %d servers", MAX_BACKENDS);
     
-    // 리스닝 소켓 설정
-    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        log_message(LOG_ERROR, "Failed to create socket");
-        return 1;
-    }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) return 1;
     
-    // SO_REUSEADDR 옵션 설정
     int reuse = 1;
-    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        log_message(LOG_ERROR, "Failed to set socket options");
-        return 1;
-    }
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    set_nonblocking(listen_fd);
     
-    // non-blocking 설정
-    if (set_nonblocking(listen_fd) < 0) {
-        return 1;
-    }
-    
-    // 리스닝 주소 설정
+    struct sockaddr_in listen_addr;
     memset(&listen_addr, 0, sizeof(listen_addr));
     listen_addr.sin_family = AF_INET;
     listen_addr.sin_port = htons(listen_port);
     listen_addr.sin_addr.s_addr = INADDR_ANY;
     
-    // 소켓 바인딩
     if (bind(listen_fd, (struct sockaddr*)&listen_addr, sizeof(listen_addr)) < 0) {
-        log_message(LOG_ERROR, "Failed to bind socket");
         close(listen_fd);
         return 1;
     }
     
-    // 리스닝 시작
     if (listen(listen_fd, SOMAXCONN) < 0) {
-        log_message(LOG_ERROR, "Failed to listen");
         close(listen_fd);
         return 1;
     }
     
-    // epoll 인스턴스 생성
     int epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
-        log_message(LOG_ERROR, "Failed to create epoll instance");
         close(listen_fd);
         return 1;
     }
     
-    // listen 소켓을 epoll에 추가
-    struct connection_state* listen_state = calloc(1, sizeof(struct connection_state));
-    listen_state->fd = listen_fd;
-    add_epoll_event(epoll_fd, listen_fd, listen_state, EPOLLIN | EPOLLET);
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;  // Edge trigger 모드
+    event.data.fd = listen_fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &event);
     
     log_message(LOG_INFO, "Reverse proxy server listening on port %d", listen_port);
     
-    // 이벤트 루프
     struct epoll_event events[MAX_EVENTS];
     while (1) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        if (nfds < 0) {
-            if (errno != EINTR) {
-                log_message(LOG_ERROR, "epoll_wait failed");
-                break;
-            }
-            continue;
-        }
+        if (nfds < 0) continue;
         
         for (int n = 0; n < nfds; n++) {
-            struct connection_state* state = events[n].data.ptr;
-            
-            if (state->fd == listen_fd) {
-                // 새로운 연결 처리
+            if (events[n].data.fd == listen_fd) {
                 handle_new_connection(epoll_fd, listen_fd);
-            } else if (!state->is_backend && state->backend_fd == -1) {
-                // 새로운 클라이언트 요청을 백엔드로 연결
-                connect_to_backend(epoll_fd, state);
             } else {
-                // 데이터 전송 처리
-                handle_data(epoll_fd, state, events[n].events);
+                handle_client(events[n].data.fd);
             }
         }
     }
     
-    // 리소스 정리
     close(epoll_fd);
     close(listen_fd);
-    free(listen_state);
-    
     return 0;
 }
