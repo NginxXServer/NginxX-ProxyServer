@@ -4,11 +4,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include "proxy.h"
 #include "threadpool.h"
 #include "health.h"
+
 #include "../utils/logger.h"
 
 #define BUFFER_SIZE 9999
@@ -17,6 +19,7 @@
 
 static struct backend_pool backend_pool;
 static struct thread_pool thread_pool;
+static pthread_mutex_t server_select_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int current_server = 0;
 
 // non-blocking 소켓 설정
@@ -37,94 +40,162 @@ static int set_nonblocking(int fd)
  */
 int select_server()
 {
+    // 라운드 로빈 방식으로 서버 선택
+
+    int selected = current_server;
+    pthread_mutex_lock(&server_select_mutex);
+
     // 서버 구성 확인
     if (MAX_BACKENDS <= 0)
     {
+        pthread_mutex_unlock(&server_select_mutex);
         log_message(LOG_ERROR, "No backend servers configured");
         return -1;
     }
 
-    // 라운드 로빈 방식으로 서버 선택
-    int selected = current_server;
     current_server = (current_server + 1) % MAX_BACKENDS;
 
     // 선택된 서버의 유효성 확인
-    struct backend_server *server = &pool.servers[selected];
+    struct backend_server *server = &backend_pool.servers[selected];
     if (server->address != NULL && server->port > 0)
     {
         log_message(LOG_INFO, "Selected backend server %s:%d",
                     server->address, server->port);
+        pthread_mutex_unlock(&server_select_mutex);
         return selected;
     }
-    else
-    {
-        log_message(LOG_ERROR, "Invalid server configuration at index %d", selected);
-        return -1;
-    }
+    pthread_mutex_unlock(&server_select_mutex);
+    log_message(LOG_ERROR, "Invalid server configuration at index %d", selected);
+    return -1;
 }
 
 void handle_connection(int client_fd, struct sockaddr_in client_addr)
 {
+    char request_id[16];
+    snprintf(request_id, sizeof(request_id), "REQ-%d", client_fd);
+    log_message(LOG_INFO, "[%s] New request started from IP: %s",
+                request_id, inet_ntoa(client_addr.sin_addr));
+
+    // 클라이언트로부터 요청 받기
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_received;
+    ssize_t bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
 
-    // 클라이언트 요청 읽기(non blcoking)
-    while ((bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0)) > 0)
+    if (bytes_received <= 0)
     {
-        buffer[bytes_received] = '\0';
-
-        // 백엔드 서버 선택
-        int server_idx = select_server();
-        if (server_idx < 0)
-        {
-            close(client_fd);
-            return;
-        }
-
-        int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (backend_fd < 0)
-        {
-            close(client_fd);
-            return;
-        }
-
-        struct backend_server *server = &backend_pool.servers[server_idx];
-        struct sockaddr_in backend_addr;
-        memset(&backend_addr, 0, sizeof(backend_addr));
-        backend_addr.sin_family = AF_INET;
-        backend_addr.sin_port = htons(server->port);
-        backend_addr.sin_addr.s_addr = inet_addr(server->address);
-
-        // 백엔드 연결 (blocking)
-        if (connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) < 0)
-        {
-            close(backend_fd);
-            close(client_fd);
-            return;
-        }
-
-        // 요청을 백엔드로 전달
-        if (send(backend_fd, buffer, bytes_received, 0) < 0)
-        {
-            close(backend_fd);
-            close(client_fd);
-            return;
-        }
-
-        // 백엔드 응답 받기 (blocking)
-        char response[BUFFER_SIZE];
-        ssize_t response_size = recv(backend_fd, response, BUFFER_SIZE - 1, 0);
-        if (response_size > 0)
-        {
-            response[response_size] = '\0';
-
-            // 응답을 클라이언트에게 전송 (non-blocking)
-            send(client_fd, response, response_size, MSG_DONTWAIT);
-        }
-
-        close(backend_fd);
+        close(client_fd);
+        return;
     }
 
+    buffer[bytes_received] = '\0';
+
+    // 백엔드 서버 선택 및 연결
+    int server_idx = select_server();
+    if (server_idx < 0)
+    {
+        close(client_fd);
+        return;
+    }
+
+    // 요청 시작 기록
+    track_request_start(&backend_pool, server_idx);
+    struct backend_server *server = &backend_pool.servers[server_idx];
+
+    log_message(LOG_INFO, "[%s] Selected backend server %s:%d",
+                request_id, server->address, server->port);
+
+    int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (backend_fd < 0)
+    {
+        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        close(client_fd);
+        return;
+    }
+
+    struct sockaddr_in backend_addr;
+    memset(&backend_addr, 0, sizeof(backend_addr));
+    backend_addr.sin_family = AF_INET;
+    backend_addr.sin_port = htons(server->port);
+    backend_addr.sin_addr.s_addr = inet_addr(server->address);
+
+    if (connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) < 0)
+    {
+        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        close(backend_fd);
+        close(client_fd);
+        return;
+    }
+
+    // 백엔드로 요청 전송
+    if (send(backend_fd, buffer, bytes_received, 0) < 0)
+    {
+        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        close(backend_fd);
+        close(client_fd);
+        return;
+    }
+
+    // 백엔드로부터 응답 받기
+    char response[BUFFER_SIZE];
+    size_t total_received = 0;
+    int success = 0;
+
+    // 응답을 완전히 받을 때까지 반복
+    while (1)
+    {
+        bytes_received = recv(backend_fd, response + total_received,
+                              BUFFER_SIZE - total_received - 1, 0);
+
+        if (bytes_received < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            break;
+        }
+        else if (bytes_received == 0) // 연결 종료
+            break;
+
+        total_received += bytes_received;
+
+        // 버퍼가 가득 차면 중단
+        if (total_received >= BUFFER_SIZE - 1)
+            break;
+    }
+
+    if (total_received > 0)
+    {
+        response[total_received] = '\0';
+
+        // 클라이언트로 전체 응답 전송
+        size_t total_sent = 0;
+        while (total_sent < total_received)
+        {
+            ssize_t sent = send(client_fd, response + total_sent,
+                                total_received - total_sent, 0);
+            if (sent < 0)
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue;
+                break;
+            }
+            total_sent += sent;
+        }
+        success = (total_sent == total_received); // 모든 데이터가 전송되었는지 확인
+    }
+
+    if (success)
+    {
+        log_message(LOG_INFO, "[%s] Request completed successfully - Sent %zu bytes",
+                    request_id, total_received);
+    }
+    else
+    {
+        log_message(LOG_ERROR, "[%s] Request failed during processing", request_id);
+    }
+
+    // 요청 추적 끝
+    track_request_end(&backend_pool, server_idx, success, !success);
+
+    close(backend_fd);
     close(client_fd);
 }
 
@@ -132,6 +203,8 @@ static void handle_new_connection(int epoll_fd, int listen_fd)
 {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
+
+    memset(&client_addr, 0, sizeof(client_addr));
 
     int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
     if (client_fd < 0)
@@ -145,22 +218,19 @@ static void handle_new_connection(int epoll_fd, int listen_fd)
         close(client_fd);
         return;
     }
-
     // 작업을 스레드 풀에 추가
     if (thread_pool_add_work(&thread_pool, client_fd, client_addr) < 0)
     {
         close(client_fd);
         return;
     }
-
-    log_message(LOG_INFO, "New connection from %s added to work queue",
-                inet_ntoa(client_addr.sin_addr));
 }
 
 int run_proxy(int listen_port)
 {
     // 백엔드 서버 초기화
-    init_backend_pool(&pool);
+    init_backend_pool(&backend_pool);
+
     log_message(LOG_INFO, "Backend server pool initialized with %d servers", MAX_BACKENDS);
 
     // 스레드 풀 초기화
@@ -224,11 +294,6 @@ int run_proxy(int listen_port)
     struct epoll_event events[MAX_EVENTS];
     while (1)
     {
-        /*
-         * EPOLLIN : 데이터가 도착해서 읽을 수 있음
-         * EPOLLOUT : 데이터를 보낼 수 있음
-         * 위의 두 event를 사용하여 이벤트 구분 및 처리
-         */
 
         // 이벤트가 발생하기를 대기, 이벤트가 발생하면 events 배열에 저장하고 nfds에 이벤트 개수 저장
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
@@ -242,25 +307,7 @@ int run_proxy(int listen_port)
         {
             if (events[n].data.fd == listen_fd)
             {
-                // 새로운 클라이언트 연결 처리
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-
-                int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
-                if (client_fd < 0)
-                {
-                    continue;
-                }
-
-                // 작업을 스레드 풀에 추가
-                if (thread_pool_add_work(&thread_pool, client_fd, client_addr) < 0)
-                {
-                    close(client_fd);
-                    continue;
-                }
-
-                log_message(LOG_INFO, "New connection from %s added to work queue",
-                            inet_ntoa(client_addr.sin_addr));
+                handle_new_connection(epoll_fd, listen_fd);
             }
         }
     }

@@ -5,6 +5,9 @@
 
 void init_backend_pool(struct backend_pool *pool)
 {
+    // 풀 mutex 초기화
+    pthread_mutex_init(&pool->pool_mutex, NULL);
+
     pool->server_count = MAX_BACKENDS;
     pool->total_requests = 0;
     pool->total_failures = 0;
@@ -14,6 +17,9 @@ void init_backend_pool(struct backend_pool *pool)
     for (int i = 0; i < pool->server_count; i++)
     {
         struct backend_server *server = &pool->servers[i];
+        // 서버별 mutex 초기화
+        pthread_mutex_init(&server->server_mutex, NULL);
+
         server->address = BACKEND_ADDRESS;
         server->port = BASE_PORT + i;
         server->is_healthy = true;
@@ -27,18 +33,37 @@ void init_backend_pool(struct backend_pool *pool)
     }
 }
 
+void cleanup_backend_pool(struct backend_pool *pool)
+{
+    // 모든 mutex 정리
+    pthread_mutex_lock(&pool->pool_mutex);
+    for (int i = 0; i < pool->server_count; i++)
+    {
+        pthread_mutex_destroy(&pool->servers[i].server_mutex);
+    }
+    pthread_mutex_unlock(&pool->pool_mutex);
+    pthread_mutex_destroy(&pool->pool_mutex);
+}
+
 void track_request_start(struct backend_pool *pool, int server_idx)
 {
     struct backend_server *server = &pool->servers[server_idx];
+
+    pthread_mutex_lock(&server->server_mutex);
     server->current_requests++;
     server->total_requests++;
+    pthread_mutex_unlock(&server->server_mutex);
+
+    pthread_mutex_lock(&pool->pool_mutex);
     pool->total_requests++;
+    pthread_mutex_unlock(&pool->pool_mutex);
 }
 
 void track_request_end(struct backend_pool *pool, int server_idx, bool success, double response_time)
 {
     struct backend_server *server = &pool->servers[server_idx];
 
+    pthread_mutex_lock(&server->server_mutex);
     server->current_requests--;
     if (!success)
     {
@@ -47,13 +72,16 @@ void track_request_end(struct backend_pool *pool, int server_idx, bool success, 
     server->total_response_time += response_time;
     server->avg_response_time = server->total_response_time / server->total_requests;
     server->failure_rate = ((double)server->total_failures / server->total_requests) * 100;
+    pthread_mutex_unlock(&server->server_mutex);
 
+    pthread_mutex_lock(&pool->pool_mutex);
     if (!success)
     {
         pool->total_failures++;
     }
     pool->total_response_time += response_time;
     pool->avg_response_time = pool->total_response_time / pool->total_requests;
+    pthread_mutex_unlock(&pool->pool_mutex);
 
     update_server_status(pool, server_idx, success);
 }
@@ -62,6 +90,7 @@ void update_server_status(struct backend_pool *pool, int server_idx, bool reques
 {
     struct backend_server *server = &pool->servers[server_idx];
 
+    pthread_mutex_lock(&server->server_mutex);
     if (!request_success)
     {
         server->failed_responses++;
@@ -75,9 +104,17 @@ void update_server_status(struct backend_pool *pool, int server_idx, bool reques
         server->failed_responses = 0;
         server->is_healthy = true;
     }
+    pthread_mutex_unlock(&server->server_mutex);
 }
 
 bool is_server_available(struct backend_pool *pool, int server_idx)
 {
-    return pool->servers[server_idx].is_healthy;
+    struct backend_server *server = &pool->servers[server_idx];
+    bool available;
+
+    pthread_mutex_lock(&server->server_mutex);
+    available = server->is_healthy;
+    pthread_mutex_unlock(&server->server_mutex);
+
+    return available;
 }
