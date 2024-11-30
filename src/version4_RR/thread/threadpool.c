@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
 #include "threadpool.h"
 #include "../proxy/proxy.h"
 #include "../utils/logger.h"
@@ -7,6 +9,11 @@
 // worker 스레드
 static void *worker_thread(void *arg)
 {
+    if (!arg)
+    {
+        log_message(LOG_ERROR, "Null thread pool argument");
+        return NULL;
+    } // debug
     struct thread_pool *pool = (struct thread_pool *)arg;
     struct work_item *work;
 
@@ -90,6 +97,7 @@ void thread_pool_destroy(struct thread_pool *pool)
 
     // 스레드 풀 종료 설정
     pthread_mutex_lock(&pool->queue.work_mutex);
+
     // 종료 siganl
     pool->shutdown = true;
     pthread_cond_broadcast(&pool->queue.work_cond);
@@ -123,11 +131,13 @@ int thread_pool_add_work(struct thread_pool *pool, int client_fd, struct sockadd
     struct work_item *work = malloc(sizeof(struct work_item));
     if (work == NULL)
     {
+        log_message(LOG_ERROR, "Failed to allocate work item");
         return -1;
     }
+    memset(work, 0, sizeof(struct work_item));
 
     work->client_fd = client_fd;
-    work->client_addr = client_addr;
+    memcpy(&(work->client_addr), &client_addr, sizeof(struct sockaddr_in));
     work->next = NULL;
 
     // 작업 큐에 추가
