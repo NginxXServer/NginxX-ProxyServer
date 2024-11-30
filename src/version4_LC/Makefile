@@ -1,16 +1,18 @@
 CC = gcc
 CFLAGS = -Wall
-INCLUDES = -I./proxy -I./utils -I./monitoring
+INCLUDES = -I./proxy -I./utils -I./monitoring -I./thread
 
 SRC_DIR = .
 PROXY_DIR = proxy
 UTILS_DIR = utils
 MONITORING_DIR = monitoring
+THREAD_DIR = thread
 
 SRC_FILES = main.c \
            $(PROXY_DIR)/proxy.c \
            $(UTILS_DIR)/logger.c \
-           $(MONITORING_DIR)/health.c
+           $(MONITORING_DIR)/health.c \
+           $(THREAD_DIR)/threadpool.c
 
 BIN_FILE = reverseProxy
 
