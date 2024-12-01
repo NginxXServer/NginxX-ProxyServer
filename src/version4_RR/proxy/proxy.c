@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdatomic.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -17,6 +19,7 @@
 #define BUFFER_SIZE 9999
 #define MAX_EVENTS 100
 #define NUM_THREADS 4
+#define CHUNK_SIZE (1024 * 1024)
 
 static struct backend_pool backend_pool;
 static struct thread_pool thread_pool;
@@ -82,8 +85,8 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
                 request_id, inet_ntoa(client_addr.sin_addr));
 
     // 클라이언트로부터 요청 받기
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
+    char buffer[CHUNK_SIZE];
+    ssize_t bytes_received = recv(client_fd, buffer, CHUNK_SIZE - 1, 0);
 
     if (bytes_received <= 0)
     {
@@ -101,7 +104,6 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
         return;
     }
 
-    // 요청 시작 기록
     track_request_start(&backend_pool, server_idx);
     struct backend_server *server = &backend_pool.servers[server_idx];
 
@@ -111,10 +113,17 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
     int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (backend_fd < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        track_request_end(&backend_pool, server_idx, 0, 1);
         close(client_fd);
         return;
     }
+
+    // 소켓 버퍼 크기 늘리기
+    int buffer_size = 10485760; // 10MB
+    setsockopt(backend_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(backend_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
 
     struct sockaddr_in backend_addr;
     memset(&backend_addr, 0, sizeof(backend_addr));
@@ -124,7 +133,7 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
 
     if (connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        track_request_end(&backend_pool, server_idx, 0, 1);
         close(backend_fd);
         close(client_fd);
         return;
@@ -133,71 +142,61 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
     // 백엔드로 요청 전송
     if (send(backend_fd, buffer, bytes_received, 0) < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1); // 실패 기록
+        track_request_end(&backend_pool, server_idx, 0, 1);
         close(backend_fd);
         close(client_fd);
         return;
     }
 
     // 백엔드로부터 응답 받기
-    char response[BUFFER_SIZE];
-    size_t total_received = 0;
-    int success = 0;
+    char response[CHUNK_SIZE];
+    int success = 1;
 
-    // 응답을 완전히 받을 때까지 반복
     while (1)
     {
-        bytes_received = recv(backend_fd, response + total_received,
-                              BUFFER_SIZE - total_received - 1, 0);
-
-        if (bytes_received < 0)
+        bytes_received = recv(backend_fd, response, CHUNK_SIZE, 0);
+        if (bytes_received <= 0)
         {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (bytes_received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
                 continue;
+            }
             break;
         }
-        else if (bytes_received == 0) // 연결 종료
-            break;
 
-        total_received += bytes_received;
-
-        // 버퍼가 가득 차면 중단
-        if (total_received >= BUFFER_SIZE - 1)
-            break;
-    }
-
-    if (total_received > 0)
-    {
-        response[total_received] = '\0';
-
-        // 클라이언트로 전체 응답 전송
+        // 클라이언트로 청크 단위 전송
         size_t total_sent = 0;
-        while (total_sent < total_received)
+        while (total_sent < bytes_received)
         {
-            ssize_t sent = send(client_fd, response + total_sent,
-                                total_received - total_sent, 0);
+            ssize_t sent = send(client_fd,
+                                response + total_sent,
+                                bytes_received - total_sent,
+                                0);
             if (sent < 0)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    usleep(1000); // 1ms 대기
                     continue;
-                break;
+                }
+                success = 0;
+                goto cleanup;
             }
             total_sent += sent;
         }
-        success = (total_sent == total_received); // 모든 데이터가 전송되었는지 확인
     }
 
+cleanup:
     if (success)
     {
-        log_message(LOG_INFO, "[%s] Request completed successfully - Sent %zu bytes",
-                    request_id, total_received);
+        log_message(LOG_INFO, "[%s] Request completed successfully",
+                    request_id);
     }
     else
     {
         log_message(LOG_ERROR, "[%s] Request failed during processing", request_id);
     }
 
-    // 요청 추적 끝
     track_request_end(&backend_pool, server_idx, success, !success);
 
     close(backend_fd);
