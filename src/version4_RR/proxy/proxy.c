@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -21,6 +22,7 @@ static struct backend_pool backend_pool;
 static struct thread_pool thread_pool;
 static pthread_mutex_t server_select_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int current_server = 0;
+static atomic_uint request_counter = 0;
 
 // non-blocking 소켓 설정
 static int set_nonblocking(int fd)
@@ -41,8 +43,6 @@ static int set_nonblocking(int fd)
 int select_server()
 {
     // 라운드 로빈 방식으로 서버 선택
-
-    int selected = current_server;
     pthread_mutex_lock(&server_select_mutex);
 
     // 서버 구성 확인
@@ -53,6 +53,7 @@ int select_server()
         return -1;
     }
 
+    int selected = current_server;
     current_server = (current_server + 1) % MAX_BACKENDS;
 
     // 선택된 서버의 유효성 확인
@@ -71,8 +72,10 @@ int select_server()
 
 void handle_connection(int client_fd, struct sockaddr_in client_addr)
 {
-    char request_id[16];
-    snprintf(request_id, sizeof(request_id), "REQ-%d", client_fd);
+    unsigned int req_num = atomic_fetch_add(&request_counter, 1);
+    char request_id[32];
+    snprintf(request_id, sizeof(request_id), "REQ-%d-%u", client_fd, req_num);
+
     log_message(LOG_INFO, "[%s] New request started from IP: %s",
                 request_id, inet_ntoa(client_addr.sin_addr));
 
@@ -204,21 +207,13 @@ static void handle_new_connection(int epoll_fd, int listen_fd)
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
-    memset(&client_addr, 0, sizeof(client_addr));
-
     int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &client_len);
     if (client_fd < 0)
     {
         return;
     }
 
-    // 클라이언트 소켓은 non blocking!
-    if (set_nonblocking(client_fd) < 0)
-    {
-        close(client_fd);
-        return;
-    }
-    // 작업을 스레드 풀에 추가
+    // client_fd를 non-blocking으로 설정하기 전에 먼저 스레드풀에 작업 추가
     if (thread_pool_add_work(&thread_pool, client_fd, client_addr) < 0)
     {
         close(client_fd);
