@@ -2,3 +2,5 @@
 [2024-11-26 23:17:59][INFO] Reverse proxy server listening on port 39071
 [2024-11-27 15:02:38][INFO] Backend server pool initialized with 5 servers
 [2024-11-27 15:02:38][INFO] Reverse proxy server listening on port 39071
+[2024-12-01 22:32:47][INFO] Backend server pool initialized with 5 servers
+[2024-12-01 22:32:47][INFO] Thread pool initialized with 4 threads

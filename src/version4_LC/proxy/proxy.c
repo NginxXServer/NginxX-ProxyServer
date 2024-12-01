@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>

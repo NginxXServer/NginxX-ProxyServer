@@ -23,6 +23,7 @@ static struct thread_pool thread_pool;
 static pthread_mutex_t server_select_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int current_server = 0;
 static atomic_uint request_counter = 0;
+static atomic_int current_server_atomic = 0;
 
 // non-blocking 소켓 설정
 static int set_nonblocking(int fd)
@@ -42,8 +43,8 @@ static int set_nonblocking(int fd)
  */
 int select_server()
 {
-    // 라운드 로빈 방식으로 서버 선택
-    pthread_mutex_lock(&server_select_mutex);
+    // // 라운드 로빈 방식으로 서버 선택
+    // pthread_mutex_lock(&server_select_mutex);
 
     // 서버 구성 확인
     if (MAX_BACKENDS <= 0)
@@ -53,8 +54,9 @@ int select_server()
         return -1;
     }
 
-    int selected = current_server;
-    current_server = (current_server + 1) % MAX_BACKENDS;
+    // int selected = current_server;
+    // current_server = (current_server + 1) % MAX_BACKENDS;
+    int selected = atomic_fetch_add(&current_server_atomic, 1) % MAX_BACKENDS;
 
     // 선택된 서버의 유효성 확인
     struct backend_server *server = &backend_pool.servers[selected];
@@ -62,10 +64,10 @@ int select_server()
     {
         log_message(LOG_INFO, "Selected backend server %s:%d",
                     server->address, server->port);
-        pthread_mutex_unlock(&server_select_mutex);
+        // pthread_mutex_unlock(&server_select_mutex);
         return selected;
     }
-    pthread_mutex_unlock(&server_select_mutex);
+    // pthread_mutex_unlock(&server_select_mutex);
     log_message(LOG_ERROR, "Invalid server configuration at index %d", selected);
     return -1;
 }
