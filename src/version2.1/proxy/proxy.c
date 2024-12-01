@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <stdbool.h>
@@ -13,7 +14,7 @@
 #include "health.h"
 #include "../utils/logger.h"
 
-#define BUFFER_SIZE 9999
+#define CHUNK_SIZE 1048576
 
 static struct backend_pool pool;
 static pthread_mutex_t server_select_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -87,17 +88,24 @@ int select_server()
  */
 void *handle_client(void *arg)
 {
-    // 연결 정보 추출
+    // 연결 정보
     struct connection_info *conn_info = (struct connection_info *)arg;
     int client_socket = conn_info->client_socket;
     struct sockaddr_in client_addr = conn_info->client_addr;
-    char buffer[BUFFER_SIZE];
-    int bytes_received;
+
+    char *buffer = malloc(CHUNK_SIZE);
+    if (buffer == NULL)
+    {
+        log_message(LOG_ERROR, "Failed to allocate buffer memory");
+        close(client_socket);
+        free(conn_info);
+        return NULL;
+    }
 
     char *client_ip = inet_ntoa(client_addr.sin_addr);
     log_message(LOG_INFO, "Handling connection from %s in new thread", client_ip);
 
-    // 백엔드 서버 선택 (health check 포함)
+    // 백엔드 서버 선택
     int server_idx = select_server();
     if (server_idx < 0)
     {
@@ -116,14 +124,21 @@ void *handle_client(void *arg)
         return NULL;
     }
 
-    // 요청 처리 시작 시간 기록
+    // TCP_NODELAY 설정
+    int flag = 1;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+    setsockopt(target_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+    // 소켓 버퍼 크기를 10MB로 설정
+    int socket_buffer_size = 10485760; // 10MB
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, (char *)&socket_buffer_size, sizeof(int));
+    setsockopt(target_socket, SOL_SOCKET, SO_SNDBUF, (char *)&socket_buffer_size, sizeof(int));
+
     struct timespec start_time;
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-    // 요청 시작 추적
     track_request_start(&pool, server_idx);
 
-    // 백엔드 서버 연결 설정
     struct sockaddr_in target_addr;
     memset(&target_addr, 0, sizeof(target_addr));
     target_addr.sin_family = AF_INET;
@@ -140,62 +155,65 @@ void *handle_client(void *arg)
     else
     {
         // 클라이언트 -> 백엔드 요청 전달
-        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0)
+        int bytes_received;
+        while ((bytes_received = recv(client_socket, buffer, CHUNK_SIZE, 0)) > 0)
         {
-            buffer[bytes_received] = '\0';
             if (send(target_socket, buffer, bytes_received, 0) < 0)
             {
                 log_message(LOG_ERROR, "Failed to send data to backend");
                 request_success = false;
+                break;
+            }
+
+            if (strstr(buffer, "\r\n\r\n") != NULL)
+            {
+                break;
             }
         }
-        else if (bytes_received < 0)
+
+        if (bytes_received < 0)
         {
             log_message(LOG_ERROR, "Failed to receive data from client");
             request_success = false;
         }
 
-        // 백엔드 -> 클라이언트 응답 전달 부분을 다음과 같이 수정
-        int total_received = 0;
-
-        while ((bytes_received = recv(target_socket, buffer + total_received,
-                                      BUFFER_SIZE - total_received - 1, 0)) > 0)
+        // 백엔드 -> 클라이언트 응답 전달
+        while (request_success && (bytes_received = recv(target_socket, buffer, CHUNK_SIZE, 0)) > 0)
         {
-            total_received += bytes_received;
-            buffer[total_received] = '\0';
-
-            // 클라이언트에게 전송
-            if (send(client_socket, buffer + (total_received - bytes_received), bytes_received, 0) < 0)
+            int bytes_sent = 0;
+            while (bytes_sent < bytes_received)
             {
-                log_message(LOG_ERROR, "Failed to send response to client");
-                request_success = false;
-                break;
+                int sent = send(client_socket, buffer + bytes_sent,
+                                bytes_received - bytes_sent, 0);
+                if (sent < 0)
+                {
+                    log_message(LOG_ERROR, "Failed to send response to client");
+                    request_success = false;
+                    break;
+                }
+                bytes_sent += sent;
             }
         }
     }
 
-    // 요청 처리 종료 시간 계산
     struct timespec end_time;
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     double response_time = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
                            (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
 
-    // 요청 종료 추적, 서버 상태 업데이트 (health check)
     track_request_end(&pool, server_idx, request_success, response_time);
 
-    // 서버별 메트릭 로깅
     log_server_metrics(server->address, server->port,
                        server->current_requests,
                        server->total_requests,
                        server->total_failures,
                        server->avg_response_time);
 
-    // 전체 시스템 메트릭 로깅
     log_system_metrics(pool.total_requests,
                        pool.total_failures,
                        pool.avg_response_time);
 
+    free(buffer);
     close(client_socket);
     close(target_socket);
     free(conn_info);
@@ -277,11 +295,9 @@ int run_proxy(int listen_port)
             continue;
         }
 
-        // 스레드를 detach 모드로 설정 (자동 리소스 정리)
         pthread_detach(thread_id);
     }
 
-    // 프로그램 종료 시 리소스 정리
     cleanup_backend_pool(&pool);
     close(listen_socket);
     return 0;
