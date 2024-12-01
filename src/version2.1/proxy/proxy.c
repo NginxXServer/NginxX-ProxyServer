@@ -156,35 +156,22 @@ void *handle_client(void *arg)
             request_success = false;
         }
 
-        // 백엔드 -> 클라이언트 응답 전달
-        bytes_received = recv(target_socket, buffer, BUFFER_SIZE - 1, 0);
-        if (bytes_received > 0)
+        // 백엔드 -> 클라이언트 응답 전달 부분을 다음과 같이 수정
+        int total_received = 0;
+
+        while ((bytes_received = recv(target_socket, buffer + total_received,
+                                      BUFFER_SIZE - total_received - 1, 0)) > 0)
         {
-            buffer[bytes_received] = '\0';
+            total_received += bytes_received;
+            buffer[total_received] = '\0';
 
-            // HTTP 상태 코드 파싱
-            int status_code = 0;
-            if (strstr(buffer, "200 OK"))
-            {
-                status_code = 200;
-            }
-            else if (strstr(buffer, "404 Not Found"))
-            {
-                status_code = 404;
-            }
-
-            log_http_response(client_ip, status_code, buffer);
-
-            if (send(client_socket, buffer, bytes_received, 0) < 0)
+            // 클라이언트에게 전송
+            if (send(client_socket, buffer + (total_received - bytes_received), bytes_received, 0) < 0)
             {
                 log_message(LOG_ERROR, "Failed to send response to client");
                 request_success = false;
+                break;
             }
-        }
-        else if (bytes_received < 0)
-        {
-            log_message(LOG_ERROR, "Failed to receive response from backend");
-            request_success = false;
         }
     }
 
