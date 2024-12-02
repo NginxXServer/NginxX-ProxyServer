@@ -32,6 +32,10 @@ struct connection
     int is_backend_connected;
     struct sockaddr_in client_addr;
     int already_cleaned;
+
+    char *write_buffer;       // pending된 쓰기 데이터 버퍼
+    size_t write_buffer_size; // 버퍼의 전체 크기
+    size_t write_buffer_sent; // 이미 전송된 크기
 };
 
 static struct backend_pool pool;
@@ -60,6 +64,11 @@ static struct connection *create_connection(int client_fd, struct sockaddr_in cl
     conn->is_backend_connected = 0;
     conn->client_addr = client_addr;
     conn->already_cleaned = 0;
+
+    conn->write_buffer = NULL;
+    conn->write_buffer_size = 0;
+    conn->write_buffer_sent = 0;
+
     memset(conn->buffer, 0, CHUNK_SIZE);
 
     return conn;
@@ -71,6 +80,10 @@ static void set_socket_buffer_size(int fd)
     int buffer_size = 10485760; // 10MB
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+
+    // SO_REUSEADDR 추가
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     // TCP_NODELAY 설정
     int flag = 1;
@@ -120,26 +133,93 @@ int select_server()
         return -1;
     }
 }
-
-// 연결 종료시 호출
 static void cleanup_connection(int epoll_fd, struct connection *conn)
 {
-    if (!conn || conn->client_fd < 0 || conn->already_cleaned) // cleanup 된 적이 있으면 skip
+    log_message(LOG_INFO, "Starting cleanup for connection");
+    if (!conn || conn->already_cleaned)
+    {
+        log_message(LOG_INFO, "Connection is null or already cleaned");
         return;
+    }
 
-    conn->already_cleaned = 1; // cleanup 시작 표시
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->client_fd, NULL);
+    log_message(LOG_INFO, "Cleaning connection - backend_fd: %d, client_fd: %d", conn->backend_fd, conn->client_fd);
+    conn->already_cleaned = 1;
+
+    if (conn->backend_fd >= 0)
+    {
+        log_message(LOG_INFO, "Closing backend_fd: %d", conn->backend_fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
+        close(conn->backend_fd);
+        conn->backend_fd = -1;
+    }
+
+    if (conn->client_fd >= 0)
+    {
+        log_message(LOG_INFO, "Closing client_fd: %d", conn->client_fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, conn->client_fd, NULL);
+        close(conn->client_fd);
+        conn->client_fd = -1;
+    }
+
+    // 서버 상태 업데이트
     if (conn->server_idx >= 0)
     {
         track_request_end(&pool, conn->server_idx, 1, 0);
+        conn->server_idx = -1;
     }
 
-    close(conn->client_fd);
-    if (conn->backend_fd >= 0)
-        close(conn->backend_fd);
+    // NULL 체크 후 메모리 해제
+    if (conn->buffer)
+    {
+        free(conn->buffer);
+        conn->buffer = NULL;
+    }
 
-    free(conn->buffer);
+    if (conn->write_buffer)
+    {
+        free(conn->write_buffer);
+        conn->write_buffer = NULL;
+    }
+
     free(conn);
+}
+
+static void handle_pending_write(int epoll_fd, struct connection *conn)
+{
+    while (conn->write_buffer_sent < conn->write_buffer_size)
+    {
+        ssize_t sent = send(conn->client_fd,
+                            conn->write_buffer + conn->write_buffer_sent,
+                            conn->write_buffer_size - conn->write_buffer_sent,
+                            MSG_NOSIGNAL);
+
+        if (sent < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return;
+            }
+            cleanup_connection(epoll_fd, conn);
+            return;
+        }
+        conn->write_buffer_sent += sent;
+    }
+
+    // 모든 데이터를 전송했다면 버퍼 정리
+    free(conn->write_buffer);
+    conn->write_buffer = NULL;
+    conn->write_buffer_size = 0;
+    conn->write_buffer_sent = 0;
+
+    // EPOLLOUT 이벤트 제거
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = conn;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client_fd, &ev) < 0)
+    {
+        cleanup_connection(epoll_fd, conn);
+        return;
+    }
 }
 
 // 클라이언트의 데이터를 읽기
@@ -170,6 +250,7 @@ static void handle_client_read(int epoll_fd, struct connection *conn)
         {
             return;
         }
+        log_message(LOG_INFO, "Connection closed during read: %s", strerror(errno));
         cleanup_connection(epoll_fd, conn);
 
         return;
@@ -185,22 +266,29 @@ static void handle_client_read(int epoll_fd, struct connection *conn)
         conn->server_idx = select_server();
         if (conn->server_idx < 0)
         {
+            log_message(LOG_ERROR, "Failed to select backend server");
             cleanup_connection(epoll_fd, conn);
-
             return;
         }
 
         struct backend_server *server = &pool.servers[conn->server_idx];
         track_request_start(&pool, conn->server_idx);
+        log_message(LOG_INFO, "Attempting to connect to backend %s:%d", server->address, server->port);
 
         // 백엔드 연결 설정
         conn->backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (conn->backend_fd < 0)
         {
+            log_message(LOG_ERROR, "Failed to create backend socket: %s", strerror(errno));
             cleanup_connection(epoll_fd, conn);
-
             return;
         }
+        log_message(LOG_INFO, "Created backend socket with fd: %d", conn->backend_fd);
+
+        // linger 옵션 설정 추가
+        struct linger sl;
+        sl.l_onoff = 1;  // linger 활성화
+        sl.l_linger = 0; // 즉시 종료
 
         set_socket_buffer_size(conn->backend_fd);
 
@@ -214,10 +302,11 @@ static void handle_client_read(int epoll_fd, struct connection *conn)
         {
             if (errno != EINPROGRESS)
             {
+                log_message(LOG_ERROR, "Backend connect failed immediately: %s", strerror(errno));
                 cleanup_connection(epoll_fd, conn);
-
                 return;
             }
+            log_message(LOG_INFO, "Backend connection in progress for fd: %d", conn->backend_fd);
         }
 
         struct epoll_event ev;
@@ -226,50 +315,36 @@ static void handle_client_read(int epoll_fd, struct connection *conn)
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn->backend_fd, &ev) < 0)
         {
             cleanup_connection(epoll_fd, conn);
-
             return;
         }
-
-        conn->is_backend_connected = 1;
     }
 }
 
 static void handle_backend_connect(int epoll_fd, struct connection *conn)
 {
+    log_message(LOG_INFO, "Checking backend connection status for fd: %d", conn->backend_fd);
     int error;
     socklen_t len = sizeof(error);
 
     // 연결 상태 확인
-    if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0)
+    if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0)
     {
         log_message(LOG_ERROR, "Failed to get socket error status: %s", strerror(errno));
         cleanup_connection(epoll_fd, conn);
-
         return;
     }
 
     if (error != 0)
     {
-        log_message(LOG_ERROR, "Backend connection failed: %s", strerror(error));
+        log_message(LOG_ERROR, "Backend connection failed with error: %s", strerror(error));
         cleanup_connection(epoll_fd, conn);
-
         return;
     }
 
-    log_message(LOG_INFO, "Backend connection established successfully");
+    log_message(LOG_INFO, "Backend connection established successfully for fd: %d", conn->backend_fd);
+    conn->is_backend_connected = 1;
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN; // 우선 이번 연결에서 모두 처리했다고 가정하고 EPOLLIN만 남겨둠
-    ev.data.ptr = conn;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0)
-    {
-        log_message(LOG_ERROR, "Failed to modify backend socket events: %s", strerror(errno));
-        cleanup_connection(epoll_fd, conn);
-
-        return;
-    }
-
-    // 클라이언트로부터 받은 데이터를 백엔드로 전송, CHUNK 단위로 전송함
+    // 클라이언트로부터 받은 데이터를 백엔드로 전송
     size_t total_sent = 0;
     while (total_sent < conn->bytes_received)
     {
@@ -281,51 +356,69 @@ static void handle_backend_connect(int epoll_fd, struct connection *conn)
         {
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                ev.events = EPOLLIN | EPOLLOUT;
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0)
-                {
-                    cleanup_connection(epoll_fd, conn);
-
-                    return;
-                }
+                // 아직 다 못보냈으니 EPOLLOUT | EPOLLIN 유지
                 conn->bytes_sent = total_sent;
                 return;
             }
             log_message(LOG_ERROR, "Failed to send data to backend: %s", strerror(errno));
             cleanup_connection(epoll_fd, conn);
-
             return;
         }
         total_sent += sent;
     }
     conn->bytes_sent = total_sent;
+
+    // 데이터를 모두 전송한 후에 EPOLLIN으로 변경
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.ptr = conn;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0)
+    {
+        log_message(LOG_ERROR, "Failed to modify backend socket events: %s", strerror(errno));
+        cleanup_connection(epoll_fd, conn);
+        return;
+    }
 }
 
 static void handle_backend_read(int epoll_fd, struct connection *conn)
 {
     char buffer[CHUNK_SIZE];
-    ssize_t total_received = 0;
 
-    while (1)
+    int max_iterations = 50;
+    int iterations = 0;
+
+    while (iterations++ < max_iterations)
     {
         ssize_t bytes_read = recv(conn->backend_fd, buffer, CHUNK_SIZE, 0);
 
-        if (bytes_read <= 0)
+        if (bytes_read == 0)
         {
-            if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            // 정상적인 연결 종료 - 남은 데이터를 모두 전송
+            if (conn->write_buffer && conn->write_buffer_size > conn->write_buffer_sent)
             {
-                break;
+                handle_pending_write(epoll_fd, conn);
             }
             cleanup_connection(epoll_fd, conn);
             return;
         }
 
-        total_received += bytes_read;
+        if (bytes_read < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                return;
+            }
+            // 에러 발생 시에도 남은 데이터 처리 시도
+            if (conn->write_buffer && conn->write_buffer_size > conn->write_buffer_sent)
+            {
+                handle_pending_write(epoll_fd, conn);
+            }
+            cleanup_connection(epoll_fd, conn);
+            return;
+        }
 
         // 클라이언트에게 전송
         size_t total_sent = 0;
-        int send_error = 0;
-
         while (total_sent < bytes_read)
         {
             ssize_t sent = send(conn->client_fd,
@@ -337,33 +430,50 @@ static void handle_backend_read(int epoll_fd, struct connection *conn)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    usleep(1000);
-                    continue;
+                    // 보내지 못한 데이터를 저장
+                    size_t remaining = bytes_read - total_sent;
+                    char *pending_data = malloc(remaining);
+                    if (!pending_data)
+                    {
+                        cleanup_connection(epoll_fd, conn);
+                        return;
+                    }
+                    memcpy(pending_data, buffer + total_sent, remaining);
+
+                    if (conn->write_buffer)
+                    {
+                        free(conn->write_buffer);
+                    }
+                    conn->write_buffer = pending_data;
+                    conn->write_buffer_size = remaining;
+                    conn->write_buffer_sent = 0;
+
+                    struct epoll_event ev;
+                    ev.events = EPOLLIN | EPOLLOUT;
+                    ev.data.ptr = conn;
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->client_fd, &ev) < 0)
+                    {
+                        cleanup_connection(epoll_fd, conn);
+                    }
+                    return;
                 }
-                log_message(LOG_ERROR, "Failed to send to client: %s", strerror(errno));
-                send_error = 1;
-                break;
+                cleanup_connection(epoll_fd, conn);
+                return;
             }
             total_sent += sent;
         }
+    }
 
-        if (send_error)
+    if (iterations >= max_iterations)
+    {
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.ptr = conn;
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0)
         {
             cleanup_connection(epoll_fd, conn);
             return;
         }
-    }
-
-    // 다음 데이터를 기다리기 위해 EPOLLIN 이벤트 다시 설정
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.ptr = conn;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->backend_fd, &ev) < 0)
-    {
-        log_message(LOG_ERROR, "Failed to modify epoll events: %s", strerror(errno));
-        cleanup_connection(epoll_fd, conn);
-
-        return;
     }
 }
 
@@ -391,9 +501,11 @@ static void handle_new_connection(int epoll_fd, int listen_fd)
     struct connection *conn = create_connection(client_fd, client_addr);
     if (!conn)
     {
+        log_message(LOG_ERROR, "Failed to create connection");
         close(client_fd);
         return;
     }
+    log_message(LOG_INFO, "Connection created successfully for fd: %d", client_fd);
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -467,7 +579,9 @@ int run_proxy(int listen_port)
     }
 
     struct epoll_event events[MAX_EVENTS];
-    while (1)
+    int running = 1;
+
+    while (running)
     {
         /*
          * EPOLLIN : 데이터가 도착해서 읽을 수 있음
@@ -480,9 +594,13 @@ int run_proxy(int listen_port)
         if (nfds < 0)
         {
             if (errno == EINTR)
+            {
+                running = 0;
                 continue;
+            }
             break;
         }
+
         for (int n = 0; n < nfds; n++)
         {
             if (events[n].data.fd == listen_fd)
@@ -491,48 +609,44 @@ int run_proxy(int listen_port)
                 handle_new_connection(epoll_fd, listen_fd);
                 continue;
             }
-            else
+
+            // 기존에 연결되어있던 클라이언트의 경우 정보 가져오기
+            struct connection *conn = (struct connection *)events[n].data.ptr;
+            if (!conn || conn->already_cleaned)
             {
-                // 기존에 연결되어있던 클라이언트의 경우 정보 가져오기
-                struct connection *conn = (struct connection *)events[n].data.ptr;
-                if (!conn || conn->client_fd < 0) // 이미 cleanup된 연결 체크
+                log_message(LOG_INFO, "Connection check - conn is null or already cleaned");
+                continue;
+            }
+
+            if (events[n].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+            {
+                cleanup_connection(epoll_fd, conn);
+                continue;
+            }
+
+            if (events[n].events & EPOLLIN)
+            {
+                if (conn->backend_fd == -1)
                 {
-                    continue;
+                    handle_client_read(epoll_fd, conn);
                 }
-
-                if (events[n].events & (EPOLLERR | EPOLLHUP))
+                else if (!conn->already_cleaned)
                 {
-                    log_message(LOG_ERROR, "Socket error or hangup detected");
-                    cleanup_connection(epoll_fd, conn);
-
-                    continue;
+                    handle_backend_read(epoll_fd, conn);
                 }
+            }
 
-                if (events[n].events & EPOLLOUT)
+            if (!conn->already_cleaned && (events[n].events & EPOLLOUT))
+            {
+                log_message(LOG_INFO, "Got EPOLLOUT event for fd: %d", events[n].events);
+                if (!conn->is_backend_connected)
                 {
-                    // 아직 리버스 프록시가 정보를 보내고 있는 상태인 경우
-                    if (!conn->is_backend_connected || conn->bytes_sent < conn->bytes_received)
-                    {
-                        handle_backend_connect(epoll_fd, conn);
-                        if (conn->client_fd < 0)
-                            continue;
-                    }
+                    log_message(LOG_INFO, "Attempting to complete backend connection for fd: %d", conn->backend_fd);
+                    handle_backend_connect(epoll_fd, conn);
                 }
-
-                if (events[n].events & EPOLLIN)
+                else if (conn->write_buffer && conn->write_buffer_size > conn->write_buffer_sent)
                 {
-                    if (conn->client_fd < 0)
-                        continue;
-                    // 백엔드 혹은 클라이언트의 데이터를 읽어야하는 경우
-                    if (conn->backend_fd == -1)
-                    {
-                        // client에서 읽기
-                        handle_client_read(epoll_fd, conn);
-                    }
-                    else
-                    {
-                        handle_backend_read(epoll_fd, conn);
-                    }
+                    handle_pending_write(epoll_fd, conn);
                 }
             }
         }
