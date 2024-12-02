@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <arpa/inet.h>
 #include "threadpool.h"
 #include "../proxy/proxy.h"
@@ -9,11 +10,6 @@
 // worker 스레드
 static void *worker_thread(void *arg)
 {
-    if (!arg)
-    {
-        log_message(LOG_ERROR, "Null thread pool argument");
-        return NULL;
-    } // debug
     struct thread_pool *pool = (struct thread_pool *)arg;
     struct work_item *work;
 
@@ -33,15 +29,20 @@ static void *worker_thread(void *arg)
         if (pool->shutdown)
         {
             pthread_mutex_unlock(&pool->queue.work_mutex);
-            pthread_exit(NULL);
+            log_message(LOG_INFO, "Worker thread shutting down...");
+            break;
         }
 
         // 큐에서 작업 가져오기
-        work = pool->queue.front;
-        pool->queue.front = work->next;
+        struct work_item *work = pool->queue.front;
+        if (!work)
+        {
+            pthread_mutex_unlock(&pool->queue.work_mutex);
+            continue;
+        }
 
-        // 큐가 빈 경우 rear 처리
-        if (pool->queue.front == NULL)
+        pool->queue.front = work->next;
+        if (!pool->queue.front)
         {
             pool->queue.rear = NULL;
         }
@@ -49,12 +50,16 @@ static void *worker_thread(void *arg)
 
         pthread_mutex_unlock(&pool->queue.work_mutex);
 
-        // 실제 작업 처리 (handle_connection)
-        handle_connection(work->client_fd, work->client_addr);
-
-        free(work);
+        // 작업 처리
+        if (work)
+        {
+            handle_connection(work->client_fd, work->client_addr);
+            free(work);
+            usleep(100); // 작업 처리 후 짧은 대기
+        }
     }
 
+    log_message(LOG_INFO, "Worker thread terminated normally");
     return NULL;
 }
 

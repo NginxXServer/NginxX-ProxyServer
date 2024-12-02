@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <signal.h>
 #include <limits.h>
 #include <stdatomic.h>
 #include <arpa/inet.h>
@@ -18,7 +19,7 @@
 
 #define BUFFER_SIZE 9999
 #define MAX_EVENTS 100
-#define NUM_THREADS 4
+#define NUM_THREADS 6
 #define CHUNK_SIZE (1024 * 1024)
 
 static struct backend_pool backend_pool;
@@ -51,6 +52,12 @@ int select_server()
     {
         struct backend_server *server = &backend_pool.servers[i];
 
+        if (!server->is_healthy && server->current_requests == 0)
+        {
+            server->is_healthy = true;
+            server->failed_responses = 0; // 실패 카운트 리셋
+        }
+
         // 서버가 유효하고 헬스 상태가 "정상"일 때만 고려
         if (server->is_healthy && server->current_requests < min_connections)
         {
@@ -60,7 +67,10 @@ int select_server()
     }
     if (selected == -1)
     {
-        log_message(LOG_ERROR, "No healthy backend servers available");
+        selected = 0;
+        backend_pool.servers[0].is_healthy = true;
+        backend_pool.servers[0].failed_responses = 0;
+        log_message(LOG_INFO, "Forcing server 0 back to healthy state");
     }
 
     return selected;
@@ -72,15 +82,14 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
     char request_id[32];
     snprintf(request_id, sizeof(request_id), "REQ-%d-%u", client_fd, req_num);
 
-    log_message(LOG_INFO, "[%s] New request started from IP: %s",
-                request_id, inet_ntoa(client_addr.sin_addr));
-
     // 클라이언트로부터 요청 받기
     char buffer[CHUNK_SIZE];
-    ssize_t bytes_received = recv(client_fd, buffer, CHUNK_SIZE - 1, 0);
+    ssize_t bytes_received;
 
+    bytes_received = recv(client_fd, buffer, CHUNK_SIZE - 1, 0);
     if (bytes_received <= 0)
     {
+        log_message(LOG_INFO, "[%s] Client connection closed or error", request_id);
         close(client_fd);
         return;
     }
@@ -104,8 +113,8 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
     int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (backend_fd < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1);
         close(client_fd);
+        track_request_end(&backend_pool, server_idx, 0, 1);
         return;
     }
 
@@ -124,74 +133,58 @@ void handle_connection(int client_fd, struct sockaddr_in client_addr)
 
     if (connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1);
         close(backend_fd);
         close(client_fd);
+        track_request_end(&backend_pool, server_idx, 0, 1);
         return;
     }
 
-    // 백엔드로 요청 전송
     if (send(backend_fd, buffer, bytes_received, 0) < 0)
     {
-        track_request_end(&backend_pool, server_idx, 0, 1);
         close(backend_fd);
         close(client_fd);
+        track_request_end(&backend_pool, server_idx, 0, 1);
         return;
     }
 
     // 백엔드로부터 응답 받기
     char response[CHUNK_SIZE];
-    int success = 1;
+    bool success = true;
 
     while (1)
     {
         bytes_received = recv(backend_fd, response, CHUNK_SIZE, 0);
         if (bytes_received <= 0)
         {
-            if (bytes_received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            {
-                continue;
-            }
-            break;
+            success = (bytes_received == 0); // 정상 종료인 경우는 성공으로 처리
+            goto cleanup;
         }
 
         // 클라이언트로 청크 단위 전송
         size_t total_sent = 0;
         while (total_sent < bytes_received)
         {
-            ssize_t sent = send(client_fd,
-                                response + total_sent,
-                                bytes_received - total_sent,
-                                0);
+            ssize_t sent = send(client_fd, response + total_sent,
+                                bytes_received - total_sent, 0);
             if (sent < 0)
             {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                 {
-                    usleep(1000); // 1ms 대기
+                    usleep(1000);
                     continue;
                 }
-                success = 0;
-                goto cleanup;
+                break;
             }
             total_sent += sent;
         }
     }
 
 cleanup:
-    if (success)
-    {
-        log_message(LOG_INFO, "[%s] Request completed successfully",
-                    request_id);
-    }
-    else
-    {
-        log_message(LOG_ERROR, "[%s] Request failed during processing", request_id);
-    }
-
-    track_request_end(&backend_pool, server_idx, success, !success);
-
+    shutdown(backend_fd, SHUT_RDWR);
+    shutdown(client_fd, SHUT_RDWR);
     close(backend_fd);
     close(client_fd);
+    track_request_end(&backend_pool, server_idx, success, !success);
 }
 
 static void handle_new_connection(int epoll_fd, int listen_fd)
@@ -279,27 +272,43 @@ int run_proxy(int listen_port)
     }
 
     struct epoll_event events[MAX_EVENTS];
+
+    signal(SIGPIPE, SIG_IGN);
+
     while (1)
     {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // timeout 1초 설정
 
-        // 이벤트가 발생하기를 대기, 이벤트가 발생하면 events 배열에 저장하고 nfds에 이벤트 개수 저장
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (nfds < 0)
         {
             if (errno == EINTR)
                 continue;
-            break;
+            log_message(LOG_ERROR, "epoll_wait error: %s", strerror(errno));
+            usleep(1000); // 에러시 잠시 대기
+            continue;     // 에러가 나도 계속 실행
         }
+
+        // 타임아웃인 경우 (nfds == 0)
+        if (nfds == 0)
+        {
+            continue;
+        }
+
         for (int n = 0; n < nfds; n++)
         {
             if (events[n].data.fd == listen_fd)
             {
+                // 에러 처리 강화
+                if (events[n].events & (EPOLLERR | EPOLLHUP))
+                {
+                    log_message(LOG_ERROR, "Listen socket error, attempting to recover...");
+                    continue;
+                }
                 handle_new_connection(epoll_fd, listen_fd);
             }
         }
     }
-
-    // 리소스 정리
+    log_message(LOG_INFO, "Destroying Thread Pool...");
     thread_pool_destroy(&thread_pool);
     close(epoll_fd);
     close(listen_fd);

@@ -35,4 +35,4 @@ int thread_pool_init(struct thread_pool *pool, int num_threads);
 void thread_pool_destroy(struct thread_pool *pool);
 int thread_pool_add_work(struct thread_pool *pool, int client_fd, struct sockaddr_in client_addr);
 
-#endif
+#endif // THREADPOOL_H

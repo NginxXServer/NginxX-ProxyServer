@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define MAX_FAILURES 3
 #define MAX_BACKENDS 5 // HTTP 서버 최대 개수
@@ -18,15 +19,15 @@ struct backend_server
     int failed_responses;
 
     // 메트릭
-    int current_requests;
-    int total_requests;
-    int total_failures;
+    atomic_int current_requests;
+    atomic_int total_requests;
+    atomic_int total_failures;
     double total_response_time;
     double avg_response_time;
     double failure_rate;
 
     // 서버별 동기화를 위한 mutex
-    pthread_mutex_t server_mutex;
+    // pthread_mutex_t server_mutex;/
 };
 
 struct backend_pool
@@ -35,13 +36,13 @@ struct backend_pool
     int server_count;
 
     // 전체 시스템 메트릭
-    int total_requests;
-    int total_failures;
+    atomic_int total_requests;
+    atomic_int total_failures;
     double total_response_time;
     double avg_response_time;
 
     // 풀 전체 동기화를 위한 mutex
-    pthread_mutex_t pool_mutex;
+    // pthread_mutex_t pool_mutex;
 };
 
 void init_backend_pool(struct backend_pool *pool);
